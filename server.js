@@ -5,45 +5,54 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "123456";
-const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN; // required
-const PAGE_ID = process.env.PAGE_ID; // required (the page you want to auto-reply for)
 
-// --- Random replies (no keyword rules) ---
-function getReply() {
-  const replies = [
-    "Thank you so much! 😊💛",
-    "So happy you enjoyed it! 😄✨",
-    "Thanks for the love! More cute videos coming soon 💛",
-    "Glad you liked it! 🤍",
-    "Appreciate your support! 💫",
-    "Happy it made you smile! 😊",
-    "More adorable moments on the way! 👶💛",
-    "Sending you love! 💛",
-    "You’re amazing! 😄",
-    "Stay tuned for more cuteness! ✨"
-  ];
-  return replies[Math.floor(Math.random() * replies.length)];
+// Put ALL page tokens here as JSON: {"PAGE_ID":"PAGE_TOKEN", ...}
+const PAGE_TOKENS_JSON = process.env.PAGE_TOKENS_JSON || "{}";
+
+// Optional: human-like delay
+const REPLY_DELAY_MS = Number(process.env.REPLY_DELAY_MS || "1200");
+
+// Random replies (no keyword rules)
+const REPLIES = [
+  "Thank you so much! 😊💛",
+  "So happy you enjoyed it! 😄✨",
+  "Thanks for the love! More cute videos coming soon 💛",
+  "Glad you liked it! 🤍",
+  "Appreciate your support! 💫",
+  "Happy it made you smile! 😊",
+  "More adorable moments on the way! 👶💛",
+  "Sending you love! 💛",
+  "You’re amazing! 😄",
+  "Stay tuned for more cuteness! ✨"
+];
+
+function pickReply() {
+  return REPLIES[Math.floor(Math.random() * REPLIES.length)];
 }
 
-// Optional: small delay to look more human (in milliseconds)
-const REPLY_DELAY_MS = Number(process.env.REPLY_DELAY_MS || "1500");
+// Parse tokens map
+let PAGE_TOKENS = {};
+try {
+  PAGE_TOKENS = JSON.parse(PAGE_TOKENS_JSON);
+} catch {
+  PAGE_TOKENS = {};
+  console.error("PAGE_TOKENS_JSON is not valid JSON");
+}
 
-// Simple in-memory de-dupe (prevents replying twice if Meta retries)
-const repliedCache = new Set();
-const CACHE_MAX = 3000;
-function cacheAdd(id) {
-  repliedCache.add(id);
-  if (repliedCache.size > CACHE_MAX) {
-    const first = repliedCache.values().next().value;
-    repliedCache.delete(first);
+// De-dupe: reply ONCE per comment id (prevents Meta retries causing multiple replies)
+const handledCommentIds = new Set();
+const CACHE_MAX = 8000;
+
+function lockComment(commentId) {
+  handledCommentIds.add(commentId);
+  if (handledCommentIds.size > CACHE_MAX) {
+    const first = handledCommentIds.values().next().value;
+    handledCommentIds.delete(first);
   }
 }
 
-app.get("/", (req, res) => {
-  res.status(200).send("OK");
-});
+app.get("/", (req, res) => res.status(200).send("OK"));
 
-// Webhook verification
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -55,33 +64,35 @@ app.get("/webhook", (req, res) => {
   return res.sendStatus(403);
 });
 
-// Reply to a comment (Graph API)
-async function replyToComment(commentId, message) {
-  if (!PAGE_ACCESS_TOKEN) throw new Error("Missing PAGE_ACCESS_TOKEN");
-  const url = `https://graph.facebook.com/v24.0/${commentId}/comments`;
+async function graphPost(path, bodyObj, pageAccessToken) {
+  const url = `https://graph.facebook.com/v24.0/${path}`;
 
   const resp = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      message,
-      access_token: PAGE_ACCESS_TOKEN
-    })
+    body: JSON.stringify({ ...bodyObj, access_token: pageAccessToken })
   });
 
   const data = await resp.json();
 
   if (!resp.ok) {
-    console.error("Reply API error:", data);
-    throw new Error(data?.error?.message || "Reply failed");
+    console.error("Graph POST error:", { path, data });
+    throw new Error(data?.error?.message || "Graph POST failed");
   }
 
   return data;
 }
 
-// Receive webhook events
+async function replyToComment(commentId, message, pageAccessToken) {
+  return graphPost(`${commentId}/comments`, { message }, pageAccessToken);
+}
+
+async function likeComment(commentId, pageAccessToken) {
+  return graphPost(`${commentId}/likes`, {}, pageAccessToken);
+}
+
 app.post("/webhook", async (req, res) => {
-  // Always ACK quickly
+  // ACK fast
   res.sendStatus(200);
 
   try {
@@ -89,20 +100,64 @@ app.post("/webhook", async (req, res) => {
     if (body?.object !== "page") return;
 
     for (const entry of body.entry || []) {
-      // Only handle the page you want (prevents cross-page noise)
-      if (PAGE_ID && String(entry.id) !== String(PAGE_ID)) continue;
+      const pageId = String(entry.id);
+      const pageToken = PAGE_TOKENS[pageId];
+
+      if (!pageToken) {
+        console.log("No token for pageId:", pageId);
+        continue;
+      }
 
       for (const change of entry.changes || []) {
         if (change.field !== "feed") continue;
 
         const v = change.value || {};
-        const item = v.item;       // "comment"
-        const verb = v.verb;       // "add"
+        const item = v.item;            // "comment"
+        const verb = v.verb;            // "add"
         const commentId = v.comment_id;
-        const commentText = v.message || "";
         const fromId = v.from?.id;
+        const commentText = v.message || "";
 
         // Only new comments
+        if (item !== "comment" || verb !== "add" || !commentId) continue;
+
+        // Avoid replying to the page itself
+        if (fromId && String(fromId) === pageId) continue;
+
+        // De-dupe lock immediately
+        if (handledCommentIds.has(commentId)) continue;
+        lockComment(commentId);
+
+        console.log("New comment:", { pageId, commentId, commentText });
+
+        setTimeout(async () => {
+          try {
+            // Like (best-effort)
+            try {
+              await likeComment(commentId, pageToken);
+              console.log("Liked:", { pageId, commentId });
+            } catch (e) {
+              console.log("Like failed (ignored):", e?.message || e);
+            }
+
+            // Reply (random)
+            const replyText = pickReply();
+            const r = await replyToComment(commentId, replyText, pageToken);
+            console.log("Replied:", { pageId, commentId, r });
+          } catch (e) {
+            console.error("Reply flow failed:", e?.message || e);
+            // Optional: allow retry if failed
+            // handledCommentIds.delete(commentId);
+          }
+        }, REPLY_DELAY_MS);
+      }
+    }
+  } catch (err) {
+    console.error("Webhook handler error:", err?.message || err);
+  }
+});
+
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));        // Only new comments
         if (item !== "comment" || verb !== "add" || !commentId) continue;
 
         // Avoid replying to the page itself
