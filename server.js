@@ -1,32 +1,34 @@
 import express from "express";
 
 const app = express();
+const PORT = process.env.PORT || 3000;
+const VERIFY_TOKEN = "123456";
+
 app.use(express.json());
 
-// الصفحة الرئيسية
 app.get("/", (req, res) => {
   res.send("Server is running");
-});
+  });
 
-// webhook verify
-app.get("/webhook", (req, res) => {
-  const VERIFY_TOKEN = "12345";
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
+  // Verify
+  app.get("/webhook", (req, res) => {
+    const mode = req.query["hub.mode"];
+      const token = req.query["hub.verify_token"];
+        const challenge = req.query["hub.challenge"];
 
-  if (mode && token === VERIFY_TOKEN) {
-    res.status(200).send(challenge);
-  } else {
-    res.sendStatus(403);
-  }
-});
+          if (mode && token === VERIFY_TOKEN) {
+              return res.status(200).send(challenge);
+                } else {
+                    return res.sendStatus(403);
+                      }
+                      });
 
-// استقبال التعليقات
-app.post("/webhook", (req, res) => {
-  console.log("Event received");
-  res.sendStatus(200);
-});
+                      // Receive events
+                      app.post("/webhook", (req, res) => {
+                        console.log("EVENT RECEIVED");
+                          res.sendStatus(200);
+                          });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Server running"));
+                          app.listen(PORT, () => {
+                            console.log(`Server running on port ${PORT}`);
+                            });
