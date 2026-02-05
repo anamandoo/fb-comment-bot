@@ -1,20 +1,49 @@
 import express from "express";
-import axios from "axios";
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-
-// لازم يكونوا متحطوطين في Render → Environment
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "123456";
-const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN || ""; // Page Access Token
+const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN; // required
+const PAGE_ID = process.env.PAGE_ID; // required (the page you want to auto-reply for)
+
+// --- Random replies (no keyword rules) ---
+function getReply() {
+  const replies = [
+    "Thank you so much! 😊💛",
+    "So happy you enjoyed it! 😄✨",
+    "Thanks for the love! More cute videos coming soon 💛",
+    "Glad you liked it! 🤍",
+    "Appreciate your support! 💫",
+    "Happy it made you smile! 😊",
+    "More adorable moments on the way! 👶💛",
+    "Sending you love! 💛",
+    "You’re amazing! 😄",
+    "Stay tuned for more cuteness! ✨"
+  ];
+  return replies[Math.floor(Math.random() * replies.length)];
+}
+
+// Optional: small delay to look more human (in milliseconds)
+const REPLY_DELAY_MS = Number(process.env.REPLY_DELAY_MS || "1500");
+
+// Simple in-memory de-dupe (prevents replying twice if Meta retries)
+const repliedCache = new Set();
+const CACHE_MAX = 3000;
+function cacheAdd(id) {
+  repliedCache.add(id);
+  if (repliedCache.size > CACHE_MAX) {
+    const first = repliedCache.values().next().value;
+    repliedCache.delete(first);
+  }
+}
 
 app.get("/", (req, res) => {
-  res.send("Server is running");
+  res.status(200).send("OK");
 });
 
-// 1) Webhook Verify (Meta)
+// Webhook verification
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -26,83 +55,86 @@ app.get("/webhook", (req, res) => {
   return res.sendStatus(403);
 });
 
-// 2) Receive events + reply to comments
+// Reply to a comment (Graph API)
+async function replyToComment(commentId, message) {
+  if (!PAGE_ACCESS_TOKEN) throw new Error("Missing PAGE_ACCESS_TOKEN");
+  const url = `https://graph.facebook.com/v24.0/${commentId}/comments`;
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      message,
+      access_token: PAGE_ACCESS_TOKEN
+    })
+  });
+
+  const data = await resp.json();
+
+  if (!resp.ok) {
+    console.error("Reply API error:", data);
+    throw new Error(data?.error?.message || "Reply failed");
+  }
+
+  return data;
+}
+
+// Receive webhook events
 app.post("/webhook", async (req, res) => {
+  // Always ACK quickly
+  res.sendStatus(200);
+
   try {
-    // اطبع الحدث عشان نعرف بييجي إزاي
-    console.log("EVENT RECEIVED:", JSON.stringify(req.body, null, 2));
-
-    // لازم نرد 200 بسرعة
-    res.sendStatus(200);
-
-    // لو مفيش توكن، مش هنعرف نرد
-    if (!PAGE_ACCESS_TOKEN) {
-      console.log("Missing PAGE_ACCESS_TOKEN in environment variables");
-      return;
-    }
-
     const body = req.body;
-    if (body.object !== "page") return;
+    if (body?.object !== "page") return;
 
-    // Meta بيبعت entries
     for (const entry of body.entry || []) {
+      // Only handle the page you want (prevents cross-page noise)
+      if (PAGE_ID && String(entry.id) !== String(PAGE_ID)) continue;
+
       for (const change of entry.changes || []) {
-        // أحداث التعليقات غالبًا بتوصل عبر feed
-        if (change.field === "feed") {
-          const v = change.value || {};
+        if (change.field !== "feed") continue;
 
-          // تعليق جديد
-          if (v.item === "comment" && v.verb === "add") {
-            const commentId = v.comment_id;
-            const msg = (v.message || "").toLowerCase();
+        const v = change.value || {};
+        const item = v.item;       // "comment"
+        const verb = v.verb;       // "add"
+        const commentId = v.comment_id;
+        const commentText = v.message || "";
+        const fromId = v.from?.id;
 
-            // تجاهل لو مفيش comment id
-            if (!commentId) continue;
+        // Only new comments
+        if (item !== "comment" || verb !== "add" || !commentId) continue;
 
-            // رد جاهز (تقدر تغيّره)
-            const reply = pickReply(msg);
+        // Avoid replying to the page itself
+        if (fromId && PAGE_ID && String(fromId) === String(PAGE_ID)) continue;
 
-            // رد على نفس التعليق
-            await replyToComment(commentId, reply);
-            console.log("Replied to comment:", commentId);
+        // De-dupe
+        if (repliedCache.has(commentId)) continue;
+
+        const replyText = getReply();
+
+        console.log("New comment:", { commentId, commentText });
+
+        // Delay to look more natural
+        setTimeout(async () => {
+          try {
+            const result = await replyToComment(commentId, replyText);
+            cacheAdd(commentId);
+            console.log("Replied:", result);
+          } catch (e) {
+            console.error("Reply failed:", e?.message || e);
           }
-        }
+        }, REPLY_DELAY_MS);
       }
     }
   } catch (err) {
-    console.log("ERROR:", err?.response?.data || err?.message || err);
-    // مفيش مشكلة لو حصل error هنا—إحنا أصلاً رجعنا 200
+    console.error("Webhook handler error:", err?.message || err);
   }
 });
 
-function pickReply(message) {
-  // ردود بسيطة لمحتوى أطفال بتضحك
-  const replies = [
-    "Thank you so much! 😊💛",
-    "So happy you enjoyed it! 😄✨",
-    "Thanks for the love! More cute videos coming soon 💛"
-  ];
-
-  if (message.includes("cute") || message.includes("adorable") || message.includes("sweet")) {
-    return "Aww thank you! 😊💛";
-  }
-
-  return replies[Math.floor(Math.random() * replies.length)];
-}
-
-async function replyToComment(commentId, text) {
-  // Graph API: POST /{comment-id}/comments
-  const url = `https://graph.facebook.com/v19.0/${commentId}/comments`;
-
-  await axios.post(
-    url,
-    null,
-    {
-      params: {
-        message: text,
-        access_token: PAGE_ACCESS_TOKEN
-      },
-      timeout: 15000
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});      timeout: 15000
     }
   );
 }
